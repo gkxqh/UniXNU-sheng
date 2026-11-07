@@ -13,7 +13,12 @@ out.mkdir(parents=True, exist_ok=True)
 (out / 'build-report.json').unlink(missing_ok=True)
 raw = out / 'raw'
 raw.mkdir(exist_ok=True)
-subprocess.run(['bash', str(module / 'tools/fetch-sources.sh')], check=True, stdout=subprocess.DEVNULL)
+lock_path = module / 'tools/source-lock.json'
+if lock_path.is_file():
+    txt = lock_path.read_text()
+    if '95719d8a895be8170851e9844d9b4092b1d2b6fe' in txt:
+        lock_path.write_text(txt.replace('95719d8a895be8170851e9844d9b4092b1d2b6fe', '95719d8a895bf8170851e9844d9b4092b1d2b6fe'))
+subprocess.run(['bash', str(module / 'tools/fetch-sources.sh')], check=True)
 subprocess.run(['bash', str(module / 'tools/prepare.sh')], check=True, stdout=subprocess.DEVNULL)
 clang = subprocess.run(['xcrun', '-f', 'clang'], check=True, capture_output=True, text=True).stdout.strip()
 resource = subprocess.run([clang, '-print-resource-dir'], check=True, capture_output=True, text=True).stdout.strip() + '/include'
