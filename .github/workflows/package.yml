@@ -130,6 +130,7 @@ jobs:
           INIT_DATA: ${{ inputs.init_data }}
           OS_PROFILE: ${{ inputs.os }}
         run: |
+          sed -i '' 's/95719d8a895be8170851e9844d9b4092b1d2b6fe/95719d8a895bf8170851e9844d9b4092b1d2b6fe/' drivers/Ath12kWifi/tools/source-lock.json || true
           args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
           if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
             args+=(--init-data)
