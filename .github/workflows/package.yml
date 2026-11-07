@@ -130,12 +130,21 @@ jobs:
           INIT_DATA: ${{ inputs.init_data }}
           OS_PROFILE: ${{ inputs.os }}
         run: |
-          sed -i '' 's/95719d8a895be8170851e9844d9b4092b1d2b6fe/95719d8a895bf8170851e9844d9b4092b1d2b6fe/' drivers/Ath12kWifi/tools/source-lock.json || true
+          sed -i '' 's/"sparse-checkout", "add"/"sparse-checkout", "set", "--no-cone"/' drivers/Ath12kWifi/tools/fetch-sources.py || true
           args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
           if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
             args+=(--init-data)
           fi
           scripts/package.sh "${args[@]}"
+      - name: dump build logs
+        if: failure()
+        run: |
+          for f in $(find UniXNU/out -name "*.log"); do
+            echo "=========================================="
+            echo "LOG: $f"
+            echo "=========================================="
+            tail -n 200 "$f"
+          done
       - uses: actions/cache/save@v4
         if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         with:
