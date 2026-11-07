@@ -1,0 +1,69 @@
+name: userdata
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS profile of the userdata image"
+        type: choice
+        options: ["27", "26", "17"]
+        default: "27"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: userdata-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  userdata:
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: gkxqh/UniXNU
+          ref: 3a24e0d5679563ae05a02cb05e0059c631a1a78f
+          path: UniXNU
+          submodules: recursive
+
+      - name: tools
+        run: |
+          brew install blacktop/tap/ipsw zstd
+          command -v /usr/bin/aea || echo "missing aea"
+          command -v ipsw || echo "missing ipsw"
+          command -v hdiutil || echo "missing hdiutil"
+
+      - name: build userdata
+        run: |
+          python3 UniXNU/unixnu build userdata -D device --os "${{ inputs.os }}"
+
+      - name: compress image
+        run: |
+          img=$(find UniXNU/out/sheng -name "userdata-root.img" | head -n 1)
+          if [ -z "$img" ]; then
+            echo "userdata-root.img not found!" >&2
+            exit 1
+          fi
+          echo "Found image: $img"
+          ls -lh "$img"
+          echo "Compressing with zstd..."
+          zstd -T0 -3 "$img" -o "${img}.zst"
+          rm -f "$img"
+          ls -lh "${img}.zst"
+
+      - name: upload userdata
+        uses: actions/upload-artifact@v4
+        with:
+          name: userdata-root-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/**/userdata/userdata-root.img.zst
+            UniXNU/out/sheng/**/userdata/userdata-root.json
