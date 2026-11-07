@@ -136,6 +136,7 @@ jobs:
           curl -sSL "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/575bbe3f83565d18caa73e9b9458f754dd286f48/ath12k/WCN7850/hw2.0/m3.bin" -o firmware/wcn7850/m3.bin
           curl -sSL "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/575bbe3f83565d18caa73e9b9458f754dd286f48/ath12k/WCN7850/hw2.0/board-2.bin" -o firmware/wcn7850/board-2.bin
           ls -lh firmware/wcn7850/
+          python3 drivers/Ath12kWifi/tools/fetch-sources.py
           args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
           if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
             args+=(--init-data)
