@@ -3,11 +3,14 @@
 // banner, the GPU rows, a caught panic message) and the kernel message buffer are written to the last 32 MiB of userdata through
 // NativeUfs's bounded log window, so a run can be read back afterwards (scripts/read-sheng-log.py over the Linux log reader).
 //
-// Window layout (4096-byte blocks): 0 header, 1..32 the kernel message buffer (oldest first), 33.. text slots of 8 blocks in a ring,
-// then the export (version 3, int-150): the newest complete blob that user space handed over (boot_log_export_put: the Metal plugin's
-// pipeline caches, so the next image can start with them) lies in NativeUfs's export region, the 256 MiB below the window, which the
-// reader fetches on its own. Its two halves alternate, so the header always names a blob that is wholly on the medium. (Version 2 kept a
-// 16 MiB area at the window's tail; the UI's pipeline caches outgrew it in int-148 and int-149.)
+// Window layout (4096-byte blocks): 0 header, 1..32 the kernel message buffer, 33.. text slots of 16 blocks in a ring, then the
+// export: the newest complete blob that user space handed over (boot_log_export_put: the Metal plugin's pipeline caches, so the next
+// image can start with them) lies in NativeUfs's export region, the 256 MiB below the window, which the reader fetches on its own. Its
+// two halves alternate, so the header always names a blob that is wholly on the medium.
+// A round writes only what changed: the blocks of a slot its text uses (the rest of the slot keeps a NUL-terminated older text that
+// the reader ignores) and the message buffer blocks that new kernel messages reached. Version 5 keeps the message area as a ring of
+// the message stream (msg_mode 1): msg_head bytes were appended in all, the newest min(msg_head, area) of them end at msg_head modulo
+// the area. msg_mode 0 is the linear form (oldest first, msg_bytes long) that the panic flush and sheng-diag=1 write.
 // The header is written last in each round, so a reader never trusts a slot or an export the header does not count yet.
 #include "BootLatencyFiles.h"
 #include <kern/thread.h>
@@ -18,6 +21,7 @@
 #include <IOKit/IOLib.h>
 extern void native_wifi_logf(int, const char *, ...) __attribute__((weak_import));
 extern void boot_cache_loader_log_capture(unsigned) __attribute__((weak_import));
+extern uint32_t boot_cache_input_ready(void) __attribute__((weak_import));
 
 #if defined(NATIVE_BOOT_PROCESS_CAPTURE) && NATIVE_BOOT_PROCESS_CAPTURE
 extern void boot_process_start(void);
@@ -89,8 +93,28 @@ extern volatile int native_cryptex_os_status __attribute__((weak_import));
 extern volatile int native_gestalt_cache_status __attribute__((weak_import));
 extern volatile int native_ls_store_status __attribute__((weak_import));
 extern volatile uint64_t native_data_persist_present __attribute__((weak_import));
+// Data disk I/O (RamBlock NativeRamBlock.cpp) and the store window's commands (ShengUfs NativeUfs.cpp), in mach_absolute_time ticks.
+extern volatile uint64_t native_data_io_reads __attribute__((weak_import)), native_data_io_read_bytes __attribute__((weak_import)),
+    native_data_io_read_ticks __attribute__((weak_import)), native_data_io_writes __attribute__((weak_import)),
+    native_data_io_write_bytes __attribute__((weak_import)), native_data_io_write_ticks __attribute__((weak_import)),
+    native_data_io_gate_ticks __attribute__((weak_import)), native_data_io_max_ticks __attribute__((weak_import)),
+    native_data_flushes __attribute__((weak_import)), native_data_flush_ticks __attribute__((weak_import)),
+    native_data_flush_blocks __attribute__((weak_import)), native_data_timer_flushes __attribute__((weak_import));
+extern volatile uint32_t native_data_write_back __attribute__((weak_import));
+extern volatile uint64_t native_ufs_store_rd_ops __attribute__((weak_import)), native_ufs_store_rd_ticks __attribute__((weak_import)),
+    native_ufs_store_wr_ops __attribute__((weak_import)), native_ufs_store_wr_ticks __attribute__((weak_import)),
+    native_ufs_store_sync_ops __attribute__((weak_import)), native_ufs_store_sync_ticks __attribute__((weak_import)),
+    native_ufs_store_max_ticks __attribute__((weak_import));
+// Command slots (ShengUfs RootCommands.h) and the root windows' reads: their count, transport time and integrity check time (CNTPCT ticks).
+extern void native_ufs_slot_stats(uint32_t *, uint32_t *, uint64_t *) __attribute__((weak_import));
+extern volatile uint64_t native_ufs_block_reads __attribute__((weak_import)), native_ufs_read_ticks __attribute__((weak_import)),
+    native_ufs_verify_ticks __attribute__((weak_import));
 extern volatile int native_staged_apps_stage __attribute__((weak_import));
 extern volatile int32_t native_buttons_stats[10] __attribute__((weak_import));
+extern volatile int32_t native_keyboard_stats[17] __attribute__((weak_import));
+extern volatile int32_t native_keyboard_accel[4] __attribute__((weak_import));
+extern volatile int32_t native_keyboard_hid_stats[6] __attribute__((weak_import));
+extern volatile int32_t native_keyboard_touch_range[4] __attribute__((weak_import));
 extern volatile int32_t native_backlight_stats[16] __attribute__((weak_import));
 extern volatile int native_staged_apps_dirs __attribute__((weak_import));
 extern volatile int native_staged_apps_files __attribute__((weak_import));
@@ -114,6 +138,16 @@ extern volatile uint32_t native_adreno_export_stats[4] __attribute__((weak_impor
 extern volatile int32_t native_touch_strokes[16][7] __attribute__((weak_import));
 extern volatile uint32_t native_touch_stroke_count __attribute__((weak_import));
 extern volatile uint32_t native_wifi_stats[29] __attribute__((weak_import));
+extern volatile uint64_t native_bluetooth_stats[32] __attribute__((weak_import));
+extern uint8_t native_bluetooth_boot_rx[512] __attribute__((weak_import));
+extern volatile uint32_t native_bluetooth_boot_rx_length __attribute__((weak_import));
+extern uint8_t native_bluetooth_boot_tail[256] __attribute__((weak_import));
+extern volatile uint32_t native_bluetooth_boot_tail_length __attribute__((weak_import));
+extern volatile uint32_t native_bluetooth_boot_state[12] __attribute__((weak_import));
+extern volatile uint32_t native_bluetooth_processes[4] __attribute__((weak_import));
+extern char *volatile native_bluetooth_boot_text __attribute__((weak_import));
+extern volatile uint32_t native_bluetooth_boot_text_length __attribute__((weak_import));
+extern volatile uint32_t qbt_transport_activity[4] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_dump[108] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_pmic[472] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_ep[16] __attribute__((weak_import));
@@ -195,6 +229,7 @@ extern volatile uint32_t native_touch_edge_stats[4] __attribute__((weak_import))
 extern volatile uint32_t native_touch_edge_install[3] __attribute__((weak_import));
 extern volatile uint32_t native_touch_hid_multi[3] __attribute__((weak_import));
 extern volatile int32_t native_backlight_request[6] __attribute__((weak_import));
+extern volatile uint32_t native_usb_stats[54] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_reassert_ticks __attribute__((weak_import));
 extern volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
 // NativeAdrenoPublish.cpp: per process name that opened the GPU, and the processes that asked the Metal discovery for its plugin.
@@ -279,6 +314,9 @@ struct boot_log_header {
   uint32_t export_below;
   // version 4: the diagnostic file export (BootDiagExport.c) at block diag_first of the export region, diag_bytes long (0 = none)
   uint32_t diag_first, diag_bytes;
+  // version 5: the message area's form (0 linear, 1 stream ring), the times the stream restarted from a fresh copy (the kernel ring
+  // moved or was replaced), and the stream bytes appended in all (low and high word)
+  uint32_t msg_mode, msg_resyncs, msg_head_lo, msg_head_hi;
 };
 // Writer state for the board page: 0 off, 1 waiting for the window, 2 writing, 3 stopped after errors, 4 stopped (GPT changed);
 // 5 in a header written by boot_log_panic_flush.
@@ -289,7 +327,9 @@ volatile uint64_t boot_log_first_lba;
 static int boot_log_started;
 static uint8_t *boot_log_buffer;   // LogMsgBlocks blocks: the message buffer, then reused for a slot and the header
 static uint8_t *boot_log_panic_buffer;   // LogMsgBlocks blocks for boot_log_panic_flush, which must not touch the writer's buffer
+static uint8_t *boot_log_msg_ring;   // LogMsgBlocks blocks: the medium's message area as the writer last left it (stream ring)
 static struct boot_log_header *volatile boot_log_live;   // the writer's header once its window is open
+static volatile int boot_log_panicked;   // set by boot_log_panic_flush: the writer no longer writes
 
 // The export: boot_log_export_put takes the blob's pieces in order (any thread) and writes them through a staging buffer straight into
 // the half of the export region that does not hold the last complete blob; once the last piece is on the medium that blob becomes the
@@ -410,7 +450,9 @@ extern uint64_t sheng_prof_ring[1024] __attribute__((weak_import));
 extern uint32_t sheng_prof_head __attribute__((weak_import));
 extern uint32_t sheng_prof_cpu[8] __attribute__((weak_import));
 extern void proc_name(int pid, char *buf, int size);
-static uint64_t prof_snap[1024], prof_rank[2048];
+// Run-time blocks: the kernel's __DATA has no room for these (prelink: native __DATA overlaps a retained segment).
+static uint64_t *prof_snap, *prof_rank;
+static char *compose_spawn;
 static void prof_sort(uint64_t *v, size_t n) {
   for (size_t start = n / 2; start-- > 0;)
     for (size_t root = start;;) {size_t c = 2 * root + 1; if (c >= n) break; if (c + 1 < n && v[c + 1] > v[c]) ++c; if (v[root] >= v[c]) break;
@@ -448,6 +490,36 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
              (unsigned long long)native_data_persist_syncs, (unsigned long long)native_data_persist_errors, (unsigned long long)native_data_persist_pages);
     at = put(out, at, cap, "[data]", 8);
     at = put(out, at, cap, row, sizeof row);
+    // Disk requests (count/MiB/ms, gate wait, longest in us), synchronize (count/ms/bitmap blocks, timer-started), store commands.
+    if (&native_data_io_reads && &native_data_write_back) {
+      uint64_t f = 0; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); if (!f) f = 19200000;
+#define BL_MS(t) ((unsigned long long)((t) * 1000ULL / f))
+#define BL_US(t) ((unsigned long long)((t) * 1000000ULL / f))
+      char io[560];
+      int n = snprintf(io, sizeof io, "DIO wb=%u rd=%llu/%lluM/%llums wr=%llu/%lluM/%llums gate=%llums max=%lluus fl=%llu/%llums/%llu tf=%llu",
+               native_data_write_back, (unsigned long long)native_data_io_reads, (unsigned long long)(native_data_io_read_bytes >> 20),
+               BL_MS(native_data_io_read_ticks), (unsigned long long)native_data_io_writes, (unsigned long long)(native_data_io_write_bytes >> 20),
+               BL_MS(native_data_io_write_ticks), BL_MS(native_data_io_gate_ticks), BL_US(native_data_io_max_ticks),
+               (unsigned long long)native_data_flushes, BL_MS(native_data_flush_ticks), (unsigned long long)native_data_flush_blocks,
+               (unsigned long long)native_data_timer_flushes);
+      if (&native_ufs_store_rd_ops && n > 0 && (size_t)n < sizeof io)
+        snprintf(io + n, sizeof io - (size_t)n, " ufs r=%llu/%llums w=%llu/%llums s=%llu/%llums umax=%lluus",
+                 (unsigned long long)native_ufs_store_rd_ops, BL_MS(native_ufs_store_rd_ticks), (unsigned long long)native_ufs_store_wr_ops,
+                 BL_MS(native_ufs_store_wr_ticks), (unsigned long long)native_ufs_store_sync_ops, BL_MS(native_ufs_store_sync_ticks),
+                 BL_US(native_ufs_store_max_ticks));
+      n = (int)strnlen(io, sizeof io);
+      if (&native_ufs_slot_stats && (size_t)n < sizeof io) {
+        uint32_t slots = 0, peak = 0; uint64_t waits = 0;
+        native_ufs_slot_stats(&slots, &peak, &waits);
+        n += snprintf(io + n, sizeof io - (size_t)n, " q=%u/%u/%llu", slots, peak, (unsigned long long)waits);
+      }
+      if (&native_ufs_block_reads && &native_ufs_read_ticks && &native_ufs_verify_ticks && n > 0 && (size_t)n < sizeof io)
+        snprintf(io + n, sizeof io - (size_t)n, " root=%llu/%llums v=%llums", (unsigned long long)native_ufs_block_reads,
+                 BL_MS(native_ufs_read_ticks), BL_MS(native_ufs_verify_ticks));
+#undef BL_MS
+#undef BL_US
+      at = put(out, at, cap, io, sizeof io);
+    }
   }
   // The payload's GPU addon (kern_exec.c native_gpu_addon_install): files in it (-1 none), written, already equal, failed, last error; then
   // the stage/status of the boot-time addon mounts (stage 5 = mounted and both entries visible): plugin, launchd job, wallpaper, audio, wallpaper floating layer
@@ -494,6 +566,28 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     snprintf(row, sizeof row, "B st=%d irq=%d rep=%d mask=%x apid=%d/%d off=%d pdc=%x err=%d spur=%d", native_buttons_stats[0], native_buttons_stats[1],
              native_buttons_stats[2], native_buttons_stats[3], native_buttons_stats[4], native_buttons_stats[5], native_buttons_stats[6],
              native_buttons_stats[7], native_buttons_stats[8], native_buttons_stats[9]);
+    at = put(out, at, cap, row, sizeof row);
+  }
+  // Keyboard cover (KeyboardProbe.cpp): stage (7 serving, negative the failed step) and its detail, engine protocol and clock, boot ROM
+  // states, image load ms, controller interrupts, frames, keyboard/consumer/touchpad reports, attach state, hall state, input enabled,
+  // I2C failures and the last error, engine interrupts, commands, authentication requests; then the HID device (KeyboardCover.cpp):
+  // starts, reports, failed reports, outputs, feature reads, last failure; the cover's accelerometer; the touchpad's raw coordinate range.
+  if (&native_keyboard_stats) {
+    char row[240];
+    int n = snprintf(row, sizeof row, "K st=%d err=%x se=%x rom=%x fw=%dms irq=%d fr=%d rep=%x att=%x hall=%x en=%d i2c=%d/%x bus=%d cmd=%d auth=%x palm=%d",
+                     native_keyboard_stats[0], native_keyboard_stats[1], native_keyboard_stats[2], native_keyboard_stats[3], native_keyboard_stats[4],
+                     native_keyboard_stats[5], native_keyboard_stats[6], native_keyboard_stats[7], native_keyboard_stats[8], native_keyboard_stats[9],
+                     native_keyboard_stats[10], native_keyboard_stats[11], native_keyboard_stats[13], native_keyboard_stats[12],
+                     native_keyboard_stats[14], native_keyboard_stats[15], native_keyboard_stats[16]);
+    if (n > 0 && (size_t)n < sizeof row && &native_keyboard_hid_stats)
+      n += snprintf(row + n, sizeof row - (size_t)n, " hid=%d/%d/%d/%d/%d/%x", native_keyboard_hid_stats[0], native_keyboard_hid_stats[1],
+                    native_keyboard_hid_stats[2], native_keyboard_hid_stats[3], native_keyboard_hid_stats[4], native_keyboard_hid_stats[5]);
+    if (n > 0 && (size_t)n < sizeof row && &native_keyboard_accel)
+      n += snprintf(row + n, sizeof row - (size_t)n, " acc=%d,%d,%d/%d", native_keyboard_accel[0], native_keyboard_accel[1],
+                    native_keyboard_accel[2], native_keyboard_accel[3]);
+    if (n > 0 && (size_t)n < sizeof row && &native_keyboard_touch_range)
+      snprintf(row + n, sizeof row - (size_t)n, " tp=x%d-%d,y%d-%d", native_keyboard_touch_range[0], native_keyboard_touch_range[1],
+               native_keyboard_touch_range[2], native_keyboard_touch_range[3]);
     at = put(out, at, cap, row, sizeof row);
   }
   // Panel brightness (AppleARMBacklight.cpp): stage (3 published, negative the failed step), requests, last level, the levels read back from
@@ -769,7 +863,7 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   if (&sheng_prof_head && &sheng_prof_ring) {
     const uint32_t head = sheng_prof_head;
     const size_t n = head < 1024 ? head : 1024;
-    if (n) {
+    if (n && prof_snap && prof_rank) {
       memcpy(prof_snap, sheng_prof_ring, n * sizeof(uint64_t));
       prof_sort(prof_snap, n);
       size_t procs = 0;
@@ -992,6 +1086,60 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     snprintf(row, sizeof row, "[export] pieces=%u refused=%u generation=%u bytes=%u | complete generation=%u bytes=%u", native_adreno_export_stats[0],
              native_adreno_export_stats[1], native_adreno_export_stats[2], native_adreno_export_stats[3], export_ready, export_ready_bytes);
     at = put(out, at, cap, row, sizeof row);
+  }
+  if (&native_bluetooth_stats && (native_bluetooth_stats[0] || native_bluetooth_stats[14])) {
+    const volatile uint64_t *b=native_bluetooth_stats;char row[300];
+    snprintf(row,sizeof row,"[bluetooth] state=%llu error=%lld phase=%llu baud=%llu tx=%llu rx=%llu irq=%llu timeout=%llu sleep=%llu smmu=%llu/%llu fsr=%llx fw=%llx qup=%llx votes=%llx soc=%llx rompatch=%llx power=%llx owners=%llx",
+        b[0],(long long)b[1],b[14],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[18],b[19],b[20],b[21]);
+    at=put(out,at,cap,row,sizeof row);
+    snprintf(row,sizeof row,"[bluetooth uart] fault=%llx/%llx/%llx/%llx malformed=%llu unmatched=%llu dma=%llu/%llu errors=%llu/%llu loop=%llx/%llx",
+        b[22],b[23],b[24],b[25],b[26],b[27],b[28],b[29],b[15],b[16],b[30],b[31]);
+    at=put(out,at,cap,row,sizeof row);
+    if(&qbt_transport_activity) {
+      snprintf(row,sizeof row,"[bluetooth stack] power=%u state=%u connect=%u channel=%u",
+          qbt_transport_activity[0],qbt_transport_activity[1],qbt_transport_activity[2],qbt_transport_activity[3]);
+      at=put(out,at,cap,row,sizeof row);
+    }
+    if(&native_bluetooth_processes) {
+      snprintf(row,sizeof row,"[bluetooth proc] bluetoothd=%u/%u BlueTool=%u/%u",
+          native_bluetooth_processes[0],native_bluetooth_processes[1],native_bluetooth_processes[2],native_bluetooth_processes[3]);
+      at=put(out,at,cap,row,sizeof row);
+    }
+    if(&native_bluetooth_boot_state && native_bluetooth_boot_state[0]) {
+      volatile uint32_t *s=native_bluetooth_boot_state;
+      snprintf(row,sizeof row,"[bluetooth boot] pins=%x/%x pre-tx-rx=%u status=%x m=%x s=%x tx=%x rx=%x fifo=%x rxlen=%u tlv=%x final=%x",
+          s[0],s[2],s[1],s[3],s[4],s[5],s[6],s[7],s[8],s[9],s[10],s[11]);
+      at=put(out,at,cap,row,sizeof row);
+    }
+    if(&native_bluetooth_boot_text_length && &native_bluetooth_boot_text && native_bluetooth_boot_text) {
+      uint32_t length=__atomic_load_n(&native_bluetooth_boot_text_length,__ATOMIC_ACQUIRE);
+      if(length>8192)length=8192;
+      for(uint32_t offset=0;offset<length;offset+=200) {
+        uint32_t n=length-offset;if(n>200)n=200;
+        snprintf(row,sizeof row,"[bluetooth boot text] %.*s",(int)n,native_bluetooth_boot_text+offset);
+        at=put(out,at,cap,row,sizeof row);
+      }
+    }
+    if(&native_bluetooth_boot_tail_length && &native_bluetooth_boot_tail) {
+      uint32_t total=__atomic_load_n(&native_bluetooth_boot_tail_length,__ATOMIC_ACQUIRE);
+      uint32_t count=total<256?total:256;
+      for(uint32_t offset=0;offset<count;offset+=32) {
+        int used=snprintf(row,sizeof row,"[bluetooth boot tail] %u/%u ",total-count+offset,total);
+        uint32_t n=count-offset;if(n>32)n=32;
+        for(uint32_t i=0;i<n;i++)used+=snprintf(row+used,sizeof row-(size_t)used,"%02x",native_bluetooth_boot_tail[(total-count+offset+i)%256]);
+        at=put(out,at,cap,row,sizeof row);
+      }
+    }
+    if(&native_bluetooth_boot_rx_length && &native_bluetooth_boot_rx) {
+      uint32_t length=__atomic_load_n(&native_bluetooth_boot_rx_length,__ATOMIC_ACQUIRE);
+      if(length>512)length=512;
+      for(uint32_t offset=0;offset<length;offset+=32) {
+        int used=snprintf(row,sizeof row,"[bluetooth boot rx] %u/%u ",offset,length);
+        uint32_t n=length-offset;if(n>32)n=32;
+        for(uint32_t i=0;i<n;i++)used+=snprintf(row+used,sizeof row-(size_t)used,"%02x",native_bluetooth_boot_rx[offset+i]);
+        at=put(out,at,cap,row,sizeof row);
+      }
+    }
   }
   // WiFi bring-up (WifiProbe.cpp): stage, GCC votes, PCIe0 GDSC, halted branches, WLAN_EN/SW_CTRL/PERST# pins, LTSSM, root port ID, link.
   if (&native_wifi_stats && native_wifi_stats[0]) {
@@ -1270,6 +1418,27 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   // send refusals.
   if (&native_battery_stats && native_battery_stats[0]) {
     char row[200];
+    if (&native_usb_stats) {
+      // QcomDwc3: stage, core id, hardware parameters 0, 3, 7, GDSCs, SMMU, repeater, rails, session bits, interrupts, power calls.
+      snprintf(row, sizeof row, "[usb] st=%d id=%x hw=%x/%x/%x gdsc=%x/%x smmu=%x rpt=%x rails=%x vbus=%x irq=%u on=%u off=%u", (int)native_usb_stats[0],
+               native_usb_stats[1], native_usb_stats[2], native_usb_stats[3], native_usb_stats[4], native_usb_stats[5], native_usb_stats[6],
+               native_usb_stats[7], native_usb_stats[8], native_usb_stats[9], native_usb_stats[10], native_usb_stats[11], native_usb_stats[12],
+               native_usb_stats[13]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[usb core] reset=%x dsts=%x dcfg=%x gctl=%x phy=%x start=%u power=%x load=%x", native_usb_stats[14], native_usb_stats[15],
+               native_usb_stats[16], native_usb_stats[17], native_usb_stats[18], native_usb_stats[19], native_usb_stats[20], native_usb_stats[21]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[usb diag] bus=%x/%x guctl1=%x gfsr=%x dsts=%x ep=%x evcount=%x ep0=%x fsr=%x evsz=%x", native_usb_stats[22],
+               native_usb_stats[23], native_usb_stats[24], native_usb_stats[25], native_usb_stats[26], native_usb_stats[27], native_usb_stats[28],
+               native_usb_stats[29], native_usb_stats[30], native_usb_stats[31]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[usb ss] retimer=%x pcs=%x reverse=%u vbus=%x ltssm=%x/%x pipe=%x cycle=%u", native_usb_stats[32], native_usb_stats[33], native_usb_stats[34], native_usb_stats[35], native_usb_stats[36], native_usb_stats[37], native_usb_stats[38], native_usb_stats[39]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[usb ucsi] state=%x status=%x cci=%x changes=%x", native_usb_stats[40], native_usb_stats[41], native_usb_stats[42], native_usb_stats[43]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[usb host] role=%x n=%u xhci=%x cmd=%x sts=%x port=%x/%x hcs=%x dev=%u last=%x", native_usb_stats[44], native_usb_stats[45], native_usb_stats[46], native_usb_stats[47], native_usb_stats[48], native_usb_stats[49], native_usb_stats[50], native_usb_stats[51], native_usb_stats[52], native_usb_stats[53]);
+      at = put(out, at, cap, row, sizeof row);
+    }
     snprintf(row, sizeof row, "[battery] st=%d pct=%d mv=%d ma=%d temp=%d fl=%x cyc=%d ans=%d to=%x ntf=%d usb=%d full=%d design=%d cycles=%d drop=%x refuse=%d",
              native_battery_stats[0], native_battery_stats[1], native_battery_stats[2], native_battery_stats[3], native_battery_stats[4],
              native_battery_stats[5], native_battery_stats[6], native_battery_stats[7], native_battery_stats[8], native_battery_stats[9],
@@ -1610,8 +1779,8 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   }
   // Which processes were started and ended (BootProgress.c census) and the throw site of the last uncaught exception (kits BootFaultProbe.c).
   if (&boot_progress_spawn_rows) {
-    static char spawn[16384];
-    const size_t n = boot_progress_spawn_rows(spawn, sizeof spawn);
+    char *const spawn = compose_spawn;
+    const size_t n = spawn ? boot_progress_spawn_rows(spawn, 16384) : 0;
     if (n) {
       at = put(out, at, cap, "[spawn]", 8);
       for (char *line = spawn; *line;) {
@@ -1653,11 +1822,60 @@ static uint32_t copy_msgbuf(uint8_t *out) {
   int size = m->msg_size, x = m->msg_bufx;
   if (x < 0 || x >= size) x = 0;
   uint32_t n = 0;
-  for (int i = 0; i < size && n < LogMsgBlocks * LogBlock; ++i) {
+  // A ring larger than the window keeps its newest bytes, which hold the end of a run.
+  int i = size > (int)(LogMsgBlocks * LogBlock) ? size - (int)(LogMsgBlocks * LogBlock) : 0;
+  for (; i < size && n < LogMsgBlocks * LogBlock; ++i) {
     char c = m->msg_bufc[(x + i) % size];
     if (c) out[n++] = (uint8_t)c;
   }
   return n;
+}
+
+// The message stream (msg_mode 1). The kernel ring is read where the last round stopped: msg_bufx is the next byte the kernel writes,
+// so the bytes from the last round's index up to it are new. The first round, and any round that finds another ring (size or buffer
+// changed), appends the whole ring oldest first instead. More than a ring of messages between two rounds loses the older part.
+// written: the stream offset up to which the medium holds the stream (a failed write leaves its bytes for the next round).
+static struct {const char *bufc; int size, bufx, synced; uint64_t head, written;} msg_stream;
+static void msg_append(uint8_t c) {
+  if (!c) return;
+  const uint64_t cap = (uint64_t)LogMsgBlocks * LogBlock;
+  boot_log_msg_ring[msg_stream.head % cap] = c;
+  ++msg_stream.head;
+}
+// Appends the kernel messages since the last round; returns the number of bytes appended.
+static uint64_t msg_stream_round(uint32_t *resyncs) {
+  struct boot_log_msgbuf *m = msgbufp;
+  const uint64_t before = msg_stream.head;
+  if (!m || !m->msg_bufc || m->msg_size <= 0) return 0;
+  const int size = m->msg_size;
+  int x = m->msg_bufx;
+  if (x < 0 || x >= size) x = 0;
+  if (!msg_stream.synced || msg_stream.bufc != m->msg_bufc || msg_stream.size != size) {
+    if (msg_stream.synced) ++*resyncs;
+    const int window = (int)(LogMsgBlocks * LogBlock);
+    for (int i = size > window ? size - window : 0; i < size; ++i) msg_append((uint8_t)m->msg_bufc[(x + i) % size]);
+    msg_stream.bufc = m->msg_bufc; msg_stream.size = size; msg_stream.synced = 1;
+  } else {
+    for (int i = msg_stream.bufx; i != x; i = i + 1 == size ? 0 : i + 1) msg_append((uint8_t)m->msg_bufc[i]);
+  }
+  msg_stream.bufx = x;
+  return msg_stream.head - before;
+}
+// Writes the blocks of the message area that the bytes not yet on the medium reached (at most the whole area, in up to two pieces).
+static int msg_stream_write(void) {
+  if (msg_stream.written == msg_stream.head) return 1;
+  uint64_t first = msg_stream.written / LogBlock, end = (msg_stream.head + LogBlock - 1) / LogBlock;
+  if (end - first > LogMsgBlocks) first = end - LogMsgBlocks;
+  int ok = 1;
+  while (ok && first < end) {
+    const uint32_t at = (uint32_t)(first % LogMsgBlocks);
+    uint32_t n = (uint32_t)(end - first);
+    if (n > LogMsgBlocks - at) n = LogMsgBlocks - at;
+    ok = native_ufs_log_write(LogMsgFirst + at, n, boot_log_msg_ring + (uint64_t)at * LogBlock);
+    first += n;
+  }
+  if (ok) msg_stream.written = msg_stream.head;
+  return ok;
 }
 
 // Log groups (boot arguments log-gpu, log-display, log-wifi, log-audio, log-input, log-power, log-sys; each =1 turns its rows on, all are off
@@ -1725,7 +1943,7 @@ static void writer(void *arg, wait_result_t result) {
   static struct boot_log_header h;
   memset(&h, 0, sizeof h);
   memcpy(h.magic, "SHLOG001", 8);
-  h.version = 4; h.header_bytes = sizeof h;
+  h.version = 5; h.header_bytes = sizeof h;
   h.export_blocks = export_region; h.export_below = export_region; h.boot_id = log_ticks(); h.first_lba = first; h.window_blocks = (uint32_t)blocks;
   h.msg_first = LogMsgFirst; h.msg_blocks = LogMsgBlocks; h.slot_first = LogSlotFirst; h.slot_blocks = LogSlotBlocks; h.slot_count = slot_count;
   h.gpt_open = h.gpt_last = &native_ufs_store_gpt_check ? native_ufs_store_gpt_check() : 0xff;
@@ -1758,16 +1976,32 @@ static void writer(void *arg, wait_result_t result) {
     const unsigned now = (unsigned)((log_ticks() - start) / f);
     if (&boot_cache_loader_log_capture) boot_cache_loader_log_capture(now);
     int ok = 1;
+    if (boot_log_panicked) return;   // the panic flush owns the window from now on
     // Text slot, then the message buffer, then the header that makes both visible.
     memset(boot_log_buffer, 0, LogSlotBlocks * LogBlock);
-    if(diag==1)snprintf((char *)boot_log_buffer,LogSlotBlocks*LogBlock,
+    size_t text;
+    if(diag==1)text=(size_t)snprintf((char *)boot_log_buffer,LogSlotBlocks*LogBlock,
       "#slot %u t=%us tag=%s latency-issues=7 export-at=%us\n",h.slots_written,now,
       &boot_progress_tag?boot_progress_tag():"",diag_at);
-    else log_groups_filter((char *)boot_log_buffer, compose((char *)boot_log_buffer, LogSlotBlocks * LogBlock, h.slots_written, now));
-    ok &= native_ufs_log_write(LogSlotFirst + (uint64_t)(h.slots_written % slot_count) * LogSlotBlocks, LogSlotBlocks, boot_log_buffer);
-    h.msg_bytes = copy_msgbuf(boot_log_buffer);
-    if(diag==1)h.msg_bytes=bl_latency_messages((char *)boot_log_buffer,h.msg_bytes);
-    ok &= native_ufs_log_write(LogMsgFirst, LogMsgBlocks, boot_log_buffer);
+    else text = log_groups_filter((char *)boot_log_buffer, compose((char *)boot_log_buffer, LogSlotBlocks * LogBlock, h.slots_written, now));
+    // The used blocks and the one holding the terminating NUL; the slot's later blocks keep an older text behind that NUL.
+    uint32_t slot_used = (uint32_t)(text / LogBlock + 1);
+    if (slot_used > LogSlotBlocks) slot_used = LogSlotBlocks;
+    ok &= native_ufs_log_write(LogSlotFirst + (uint64_t)(h.slots_written % slot_count) * LogSlotBlocks, slot_used, boot_log_buffer);
+    if (diag == 1 || !boot_log_msg_ring) {
+      // sheng-diag=1 keeps only the latency lines, so its message area stays linear and is written whole.
+      h.msg_bytes = copy_msgbuf(boot_log_buffer);
+      if(diag==1)h.msg_bytes=bl_latency_messages((char *)boot_log_buffer,h.msg_bytes);
+      ok &= native_ufs_log_write(LogMsgFirst, LogMsgBlocks, boot_log_buffer);
+      h.msg_mode = 0;
+    } else {
+      msg_stream_round(&h.msg_resyncs);
+      ok &= msg_stream_write();
+      // The header names only what is on the medium.
+      const uint64_t cap = (uint64_t)LogMsgBlocks * LogBlock, head = msg_stream.written;
+      h.msg_mode = 1; h.msg_head_lo = (uint32_t)head; h.msg_head_hi = (uint32_t)(head >> 32);
+      h.msg_bytes = (uint32_t)(head < cap ? head : cap);
+    }
     if (ok) ++h.slots_written;
     else ++h.write_errors;
     // The newest complete export is already on the medium; the header names it.
@@ -1776,7 +2010,7 @@ static void writer(void *arg, wait_result_t result) {
     h.diag_first = diag_first; h.diag_bytes = diag_bytes;
     IOLockUnlock(export_lock);
     if (diag == 1 && &boot_diag_shot_tick) boot_diag_shot_tick(now);
-    if (diag_at && now >= diag_at && !boot_diag_status) {
+    if (((diag_at && now >= diag_at) || (&boot_cache_input_ready && boot_cache_input_ready())) && !boot_diag_status) {
       thread_t diag;
       boot_diag_status = 1;
       if (kernel_thread_start_priority(diag_thread, NULL, MINPRI_KERNEL, &diag) == KERN_SUCCESS) thread_deallocate(diag);
@@ -1785,6 +2019,7 @@ static void writer(void *arg, wait_result_t result) {
     h.uptime_s = now; h.rounds = ++boot_log_rounds; h.state = boot_log_state;
     // Every 30 rounds the GPT is read back; any change stops the writer for good.
     if (&native_ufs_store_gpt_check && !(h.rounds % 30)) h.gpt_last = native_ufs_store_gpt_check();
+    if (boot_log_panicked) return;
     memset(boot_log_buffer, 0, LogBlock);
     memcpy(boot_log_buffer, &h, sizeof h);
     ok &= native_ufs_log_write(0, 1, boot_log_buffer);
@@ -1817,18 +2052,23 @@ void boot_log_panic_flush(void) {
   struct boot_log_header *live = boot_log_live;
   if (done || !live || !boot_log_panic_buffer || !&native_ufs_log_panic || !native_ufs_log_panic()) return;
   done = 1;
+  boot_log_panicked = 1;
   uint32_t n = copy_msgbuf(boot_log_panic_buffer);
   const uint32_t cap = LogMsgBlocks * LogBlock;
   if (&boot_progress_panic_text && boot_progress_panic_text[0]) {
     uint32_t len = (uint32_t)strnlen(boot_progress_panic_text, 2048);
-    if (n > cap - len - 10) n = cap - len - 10;   // a full buffer loses its newest lines to the panic text
+    if (n > cap - len - 10) {   // a full buffer gives up its oldest lines to the panic text
+      const uint32_t drop = n - (cap - len - 10);
+      memmove(boot_log_panic_buffer, boot_log_panic_buffer + drop, n - drop);
+      n -= drop;
+    }
     memcpy(boot_log_panic_buffer + n, "\n[panic] ", 9);
     memcpy(boot_log_panic_buffer + n + 9, boot_progress_panic_text, len);
     n += 9 + len;
     boot_log_panic_buffer[n++] = '\n';
   }
   struct boot_log_header h = *live;
-  h.msg_bytes = n; h.rounds++; h.state = 5;
+  h.msg_bytes = n; h.msg_mode = 0; h.rounds++; h.state = 5;   // the linear form, whole area
   native_ufs_log_write(LogMsgFirst, LogMsgBlocks, boot_log_panic_buffer);
   memset(boot_log_panic_buffer, 0, LogBlock);
   memcpy(boot_log_panic_buffer, &h, sizeof h);
@@ -1858,6 +2098,12 @@ void boot_log_tick(unsigned now) {
   boot_log_buffer = (uint8_t *)IOMallocAligned(LogMsgBlocks * LogBlock, LogBlock);
   if (!boot_log_buffer) return;
   boot_log_panic_buffer = (uint8_t *)IOMallocAligned(LogMsgBlocks * LogBlock, LogBlock);
+  // Without the ring the writer falls back to the linear message area, written whole every round.
+  boot_log_msg_ring = (uint8_t *)IOMallocAligned(LogMsgBlocks * LogBlock, LogBlock);
+  if (boot_log_msg_ring) memset(boot_log_msg_ring, 0, LogMsgBlocks * LogBlock);
+  prof_snap = (uint64_t *)IOMalloc(1024 * sizeof(uint64_t));
+  prof_rank = (uint64_t *)IOMalloc(2048 * sizeof(uint64_t));
+  compose_spawn = (char *)IOMalloc(16384);
   export_lock = IOLockAlloc();
 #if defined(NATIVE_BOOT_PROCESS_CAPTURE) && NATIVE_BOOT_PROCESS_CAPTURE
   uint32_t diag = 0;
