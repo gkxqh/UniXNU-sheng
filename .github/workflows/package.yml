@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: gkxqh/UniXNU
-          ref: 3a24e0d5679563ae05a02cb05e0059c631a1a78f # Wi-Fi runtime and Data firmware integration + mesa patch fix
+          ref: main
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
@@ -130,6 +130,7 @@ jobs:
           INIT_DATA: ${{ inputs.init_data }}
           OS_PROFILE: ${{ inputs.os }}
         run: |
+          sed -i '' 's|--- /dev/null|new file mode 100644\n--- /dev/null|' ../UniXNU/patches/mesa/turnip-frame-diagnostics.patch || true
           sed -i '' 's/"sparse-checkout", "add"/"sparse-checkout", "set", "--no-cone"/' drivers/Ath12kWifi/tools/fetch-sources.py || true
           mkdir -p firmware/wcn7850
           curl -sSL "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/575bbe3f83565d18caa73e9b9458f754dd286f48/ath12k/WCN7850/hw2.0/amss.bin" -o firmware/wcn7850/amss.bin
