@@ -1,0 +1,36 @@
+[Defines]
+  INF_VERSION                    = 0x0001001B
+  BASE_NAME                      = ShengUfsBlockIoDxe
+  FILE_GUID                      = 8B4E1A2C-9F3D-4C7A-B6E2-1D5F8A3C7E91
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = ShengUfsBlockIoDxeEntry
+
+[Sources]
+  ShengUfsBlockIoDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  QcomPkg/QcomPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  CacheMaintenanceLib
+  DebugLib
+  DevicePathLib
+  IoLib
+  MemoryAllocationLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Guids]
+  gEfiUfsLU0Guid
+
+[Protocols]
+  gEfiBlockIoProtocolGuid                       ## PRODUCES
+  gEfiDevicePathProtocolGuid                    ## PRODUCES
+
+[Depex]
+  TRUE

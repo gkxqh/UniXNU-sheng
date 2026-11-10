@@ -1,0 +1,60 @@
+name: uefi-only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uefi-only-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-uefi:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          repository: gkxqh/UniXNU
+          ref: main
+          path: UniXNU
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          path: uefi-sheng
+          submodules: false
+      - name: tools
+        run: |
+          brew install dtc llvm lld cmake ninja
+          {
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+          } >> "$GITHUB_PATH"
+      - name: build firmware
+        working-directory: device
+        run: |
+          git -C ../uefi-sheng submodule update --init --depth 1 -- Common/Mu Common/Mu_OEM_Sample Silicium-ACPI Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl
+          cp -R uefi-overlay/* ../uefi-sheng/
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path('board.toml')
+          txt = p.read_text()
+          txt = re.sub(r'"preflight"\s*=\s*\[[^\]]*\]', '"preflight" = []', txt, count=1)
+          p.write_text(txt)
+          PY
+          python3 ../UniXNU/unixnu build firmware -D . --uefi ../uefi-sheng
+      - name: upload fd
+        uses: actions/upload-artifact@v4
+        with:
+          name: uefi-fd
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            uefi-sheng/Build/shengPkg/*/FV/SILICIUM_UEFI.fd
