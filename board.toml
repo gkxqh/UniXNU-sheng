@@ -46,7 +46,7 @@
 "bytes" = 7609308281
 
 ["firmware"."defines"]
-"ENABLE_SECUREBOOT" = "1"
+"ENABLE_SECUREBOOT" = "0"
 "DEVICE_MODEL" = "sheng"
 "MEMORY_PROTECTION" = "TRUE"
 "SHIP_MODE" = "FALSE"
